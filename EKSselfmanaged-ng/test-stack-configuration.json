@@ -1,0 +1,16 @@
+{
+  "Parameters" : {
+    "VPCStackName" : "prod-vpc",
+    "EKSStackName" : "prod-private-eks-cluster1",
+    "EksClusterName" : "prod-private-eks-cluster1-EksCluster",
+    "NodeGroupName" : "ng",
+    "NodeImageId" : "",
+    "NodeImageIdSSMParam" : "/aws/service/eks/optimized-ami/1.19/amazon-linux-2/recommended/image_id",
+    "NodeInstanceType" : "m5n.4xlarge",
+    "LambdaS3Bucket" : "hivanr",
+    "LambdaS3Key" : "lambda_function.zip",
+    "NodeAutoScalingGroupDesiredCapacity" : "1",
+    "NodeAutoScalingGroupMaxSize" : "2",
+    "NodeAutoScalingGroupMinSize" : "1"
+  }
+}

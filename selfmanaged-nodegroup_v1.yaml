@@ -1,0 +1,378 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Amazon EKS - Node Group
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: EKS Cluster
+        Parameters:
+          - EksClusterName
+          - VPCStackName
+          - EKSStackName
+      - Label:
+          default: Worker Node Configuration
+        Parameters:
+          - NodeGroupName
+          - NodeAutoScalingGroupMinSize
+          - NodeAutoScalingGroupDesiredCapacity
+          - NodeAutoScalingGroupMaxSize
+          - NodeInstanceType
+          - NodeImageIdSSMParam
+          - NodeImageId
+          - NodeVolumeSize
+          - BootstrapArguments
+      - Label:
+          default: Multus CNI Configuration
+        Parameters:
+          - LambdaS3Bucket
+          - LambdaS3Key
+
+Parameters:
+  BootstrapArguments:
+    Type: String
+    Default: "--apiserver-endpoint <api-server-endpoint> --b64-cluster-ca  <certificate-authority> --kubelet-extra-args '--reserved-cpus=0-1 --feature-gates=TopologyManager=true --topology-manager-policy=single-numa-node --cpu-manager-policy=static'"
+    Description: "Arguments to pass to the bootstrap script. See files/bootstrap.sh in https://github.com/awslabs/amazon-eks-ami"
+
+  VPCStackName:
+    Type: String
+    Description: Name of VPC Stack.
+    Default: ${VPCStackName}
+
+  EKSStackName:
+    Type: String
+    Description: Name of VPC Stack.
+    Default: ${EKSStackName}
+
+  EksClusterName:
+    Type: String
+    Description: The EKS cluster name provided when the cluster was created. If it is incorrect, nodes will not be able to join the cluster.
+    Default: ${EksClusterName}
+
+  NodeAutoScalingGroupDesiredCapacity:
+    Type: String
+    Default: ${NodeAutoScalingGroupDesiredCapacity}
+    Description: Desired capacity of Node Group ASG.
+    
+  NodeAutoScalingGroupMaxSize:
+    Type: String
+    Default: ${NodeAutoScalingGroupMaxSize}
+    Description: Maximum size of Node Group ASG. Set to at least 1 greater than NodeAutoScalingGroupDesiredCapacity.
+   
+  NodeAutoScalingGroupMinSize:
+    Type: String
+    Default: ${NodeAutoScalingGroupMinSize}
+    Description: Minimum size of Node Group ASG.
+    
+  NodeGroupName:
+    Type: String
+    Description: Unique identifier for the Node Group.
+    Default: ${NodeGroupName}
+
+  NodeImageId:
+    Type: String
+    Default: ${NodeImageId}
+    Description: (Optional) Specify your own custom image ID. This value overrides any AWS Systems Manager Parameter Store value specified above.
+
+  NodeImageIdSSMParam:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: ${NodeImageIdSSMParam}    #/aws/service/eks/optimized-ami/1.19/amazon-linux-2/recommended/image_id
+    Description: AWS Systems Manager Parameter Store parameter of the AMI ID for the worker node instances.
+
+  NodeInstanceType:
+    Type: String
+    Default: ${NodeInstanceType}    #m5n.4xlarge
+    Description: EC2 instance type for the node instances
+
+  NodeVolumeSize:
+    Type: Number
+    Default: 40
+    Description: Node volume size
+
+  LambdaS3Bucket:
+    Type: String
+    Description: Specify S3 Bucket(directory) where you locate Lambda Function
+    Default: ${LambdaS3Bucket}
+
+  LambdaS3Key:
+    Type: String
+    Description: Specify S3 Key(filename) of your Lambda Function
+    Default: ${LambdaS3Key}    #lambda_function.zip
+
+Conditions:
+  HasNodeImageId: !Not
+    - "Fn::Equals":
+        - Ref: NodeImageId
+        - ""
+
+Resources:
+  NodeLaunchConfig:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      AssociatePublicIpAddress: "false"
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdb          #see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html?icmpid=docs_ec2_console for device mapping
+          VirtualName: ephemeral0       #if using instance store1 
+      IamInstanceProfile:
+        Fn::ImportValue:
+          !Sub "${EKSStackName}-NodeInstanceProfile"
+      ImageId: !If
+        - HasNodeImageId
+        - Ref: NodeImageId
+        - Ref: NodeImageIdSSMParam
+      InstanceType: !Ref NodeInstanceType
+      KeyName:
+        Fn::ImportValue:
+          !Sub "${EKSStackName}-KeyPairName"
+      SecurityGroups:
+        - Fn::ImportValue:
+            !Sub "${EKSStackName}-NodeSecurityGroup"
+      UserData: !Base64
+        "Fn::Sub": |
+          #!/bin/bash
+          set -o xtrace
+          /etc/eks/bootstrap.sh ${EksClusterName} ${BootstrapArguments}
+          /opt/aws/bin/cfn-signal --exit-code $? \
+                   --stack  ${AWS::StackName} \
+                   --resource NodeGroup  \
+                   --region ${AWS::Region}
+          echo 4096 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+          sleep 60
+          ls /sys/class/net/ > /tmp/ethList;cat /tmp/ethList |while read line ; do sudo ifconfig $line up; done
+          grep eth /tmp/ethList |while read line ; do echo "ifconfig $line up" >> /etc/rc.d/rc.local; done
+          systemctl enable rc-local
+          chmod +x /etc/rc.d/rc.local
+          # Uncomment the below line for DPDK AMI
+          systemctl enable config-sriov; systemctl start config-sriov
+          reboot
+
+  PlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: spread
+
+  NodeGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      DesiredCapacity: !Ref NodeAutoScalingGroupDesiredCapacity
+      LaunchConfigurationName: !Ref NodeLaunchConfig
+      MaxSize: !Ref NodeAutoScalingGroupMaxSize
+      MinSize: !Ref NodeAutoScalingGroupMinSize
+      PlacementGroup: !Ref PlacementGroup
+      Tags:
+        - Key: Name
+          PropagateAtLaunch: "true"
+          Value: !Sub ${EksClusterName}-${NodeGroupName}-Node
+        - Key: !Sub kubernetes.io/cluster/${EksClusterName}
+          PropagateAtLaunch: "true"
+          Value: owned
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            !Sub "${VPCStackName}-VpcCNI"
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: "1"
+        MinInstancesInService: !Ref NodeAutoScalingGroupDesiredCapacity
+        PauseTime: PT5M
+  # End of NodeGroup Creation
+
+  # LifeCycleHook for AutoScalingGroup (NodeGroup)
+  LchookEc2Ins:
+    Type: "AWS::AutoScaling::LifecycleHook"
+    Properties:
+      AutoScalingGroupName: !Ref NodeGroup
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_LAUNCHING"
+      DefaultResult: "ABANDON"
+      HeartbeatTimeout: "300"
+
+  LchookEc2Term:
+    Type: "AWS::AutoScaling::LifecycleHook"
+    Properties:
+      AutoScalingGroupName: !Ref NodeGroup
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+      DefaultResult: "ABANDON"
+      HeartbeatTimeout: "300"
+
+  # Lambda Creation
+  RoleLambdaAttach2ndEniCfn:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /
+
+  PolicyLambdaAttach2ndEniCfn:
+    Type: "AWS::IAM::Policy"
+    DependsOn: RoleLambdaAttach2ndEniCfn
+    Properties:
+      PolicyName: LambdaAttach2ndEniCfn
+      Roles: [
+      !Ref RoleLambdaAttach2ndEniCfn
+      ]
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: [
+              "ec2:CreateNetworkInterface",
+              "ec2:DescribeInstances",
+              "ec2:DetachNetworkInterface",
+              "ec2:ModifyNetworkInterfaceAttribute",
+              "autoscaling:CompleteLifecycleAction",
+              "ec2:DeleteTags",
+              "ec2:DescribeNetworkInterfaces",
+              "ec2:CreateTags",
+              "ec2:DeleteNetworkInterface",
+              "ec2:AttachNetworkInterface",
+              "autoscaling:DescribeAutoScalingGroups",
+              "ec2:TerminateInstances"
+            ]
+            Resource: "*"
+          - Effect: Allow
+            Action: [
+              "logs:CreateLogStream",
+              "logs:PutLogEvents"
+            ]
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action: "logs:CreateLogGroup"
+            Resource: "arn:aws:logs:*:*:*"
+
+  LambdaAttach2ndENI:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: "python3.9"
+      Handler: "lambda_function.lambda_handler"
+      Role: !GetAtt RoleLambdaAttach2ndEniCfn.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Timeout: "60"
+      Environment:
+        Variables:
+          SubnetId1:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-SessionDBCRDL"
+          SubnetId2:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-GreTunnel"
+          SubnetId3:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-EMXSignaling"
+          SubnetId4:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-InternalOAM"
+          SubnetId5:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-H248UPCMPSC"
+          SubnetId6:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-OAMExternal"
+          SubnetId7:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-CoreMedia"
+#          SubnetId8:
+#            Fn::ImportValue:
+#              !Sub "${VPCStackName}-CoreSignaling"
+          SecGroupId1:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+          SecGroupId2:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+          SecGroupId3:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+          SecGroupId4:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+          SecGroupId5:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+          SecGroupId6:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+          SecGroupId7:
+            Fn::ImportValue:
+              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+#          SecGroupId8:
+#            Fn::ImportValue:
+#              !Sub "${VPCStackName}-PrivateSubnetSecurityGroup"
+  # End of Lambda
+
+  # CloudWatch Event Trigger
+  NewInstanceEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      EventPattern:
+        source:
+          - "aws.autoscaling"
+        detail-type:
+          - "EC2 Instance-launch Lifecycle Action"
+          - "EC2 Instance-terminate Lifecycle Action"
+        detail:
+          AutoScalingGroupName:
+            - !Ref NodeGroup
+      Targets:
+        -
+          Arn: !GetAtt LambdaAttach2ndENI.Arn
+          Id: Lambda1
+  PermissionForEventsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName:
+        Ref: "LambdaAttach2ndENI"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "NewInstanceEventRule"
+          - "Arn"
+
+  LambdaReStartFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, json
+          import cfnresponse
+          asg_client = boto3.client('autoscaling')
+          ec2_client = boto3.client('ec2')
+
+          def handler (event, context):
+              AutoScalingGroupName = event['ResourceProperties']['AsgName']
+              asg_response = asg_client.describe_auto_scaling_groups(AutoScalingGroupNames=[AutoScalingGroupName])
+              instance_ids = []
+
+              for i in asg_response['AutoScalingGroups']:
+                for k in i['Instances']:
+                  instance_ids.append(k['InstanceId'])
+
+              if instance_ids != []:
+                ec2_client.terminate_instances(
+                  InstanceIds = instance_ids
+                )
+              responseValue = 1
+              responseData = {}
+              responseData['Data'] = responseValue
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+
+      Handler: index.handler
+      Runtime: "python3.9"
+      Timeout: "60"
+      Role: !GetAtt RoleLambdaAttach2ndEniCfn.Arn
+
+  CustomResource:
+    Type: Custom::CustomResource
+    DependsOn: NodeGroup
+    Properties:
+      ServiceToken: !GetAtt 'LambdaReStartFunction.Arn'
+      AsgName: !Ref NodeGroup
+

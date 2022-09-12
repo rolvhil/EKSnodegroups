@@ -1,0 +1,16 @@
+{
+  "Parameters" : {
+    "VPCStackName" : "prod-vims-vpc",
+    "EKSStackName" : "prod-vims-private-eks-cluster1",
+    "EksClusterName" : "prod-vims-private-eks-cluster1-EksCluster",
+    "NodeGroupName" : "vIMS-ng",
+    "NodeImageId" : "ami-0bbf064c4581b59a1",
+    "NodeImageIdSSMParam" : "/aws/service/eks/optimized-ami/1.19/amazon-linux-2/recommended/image_id",
+    "NodeInstanceType" : "x1.16xlarge",
+    "LambdaS3Bucket" : "mavenir-hivanr",
+    "LambdaS3Key" : "lambda_function.zip",
+    "NodeAutoScalingGroupDesiredCapacity" : "1",
+    "NodeAutoScalingGroupMaxSize" : "2",
+    "NodeAutoScalingGroupMinSize" : "1"
+  }
+}
